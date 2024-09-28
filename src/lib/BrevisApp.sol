@@ -21,15 +21,24 @@ abstract contract BrevisApp {
         brevisRequest = _brevisRequest;
     }
 
-    function handleProofResult(bytes32 _vkHash, bytes calldata _appCircuitOutput) internal virtual {
+    function handleProofResult(
+        bytes32 _vkHash,
+        bytes calldata _appCircuitOutput
+    ) internal virtual {
         // to be overrided by custom app
     }
 
-    function handleOpProofResult(bytes32 _vkHash, bytes calldata _appCircuitOutput) internal virtual {
+    function handleOpProofResult(
+        bytes32 _vkHash,
+        bytes calldata _appCircuitOutput
+    ) internal virtual {
         // to be overrided by custom app
     }
 
-    function brevisCallback(bytes32 _appVkHash, bytes calldata _appCircuitOutput) external onlyBrevisRequest {
+    function brevisCallback(
+        bytes32 _appVkHash,
+        bytes calldata _appCircuitOutput
+    ) external onlyBrevisRequest {
         handleProofResult(_appVkHash, _appCircuitOutput);
     }
 
@@ -61,7 +70,10 @@ abstract contract BrevisApp {
             ),
             "data not ready to use"
         );
-        require(_appCommitHash == keccak256(_appCircuitOutput), "invalid circuit output");
+        require(
+            _appCommitHash == keccak256(_appCircuitOutput),
+            "invalid circuit output"
+        );
         handleOpProofResult(_appVkHash, _appCircuitOutput);
     }
 
@@ -85,7 +97,10 @@ abstract contract BrevisApp {
             "data not ready to use"
         );
         for (uint256 i = 0; i < _proofIds.length; i++) {
-            require(_appCommitHashes[i] == keccak256(_appCircuitOutputs[i]), "invalid circuit output");
+            require(
+                _appCommitHashes[i] == keccak256(_appCircuitOutputs[i]),
+                "invalid circuit output"
+            );
             handleOpProofResult(_appVkHashes[i], _appCircuitOutputs[i]);
         }
     }

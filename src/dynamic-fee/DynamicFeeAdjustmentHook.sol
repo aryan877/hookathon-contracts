@@ -11,13 +11,16 @@ import {Currency, CurrencyLibrary} from "pancake-v4-core/src/types/Currency.sol"
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {LPFeeLibrary} from "pancake-v4-core/src/libraries/LPFeeLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "pancake-v4-core/src/types/BeforeSwapDelta.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "pancake-v4-core/src/types/BalanceDelta.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BrevisApp} from "../lib/BrevisApp.sol";
-import {IBrevisProof} from "../interface/IBrevisProof.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+    using SafeERC20 for IERC20;
 
     struct PoolData {
         uint256 cumulativeVolume;
@@ -58,14 +61,18 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
         uint256 impermanentLoss
     );
 
+    struct CallbackData {
+        address sender;
+        PoolKey key;
+        ICLPoolManager.SwapParams swapParams;
+        ICLPoolManager.ModifyLiquidityParams modifyLiquidityParams;
+        BalanceDelta delta;
+    }
+
     constructor(
         ICLPoolManager _poolManager,
-        IBrevisProof _brevisProof
-    )
-        CLBaseHook(_poolManager)
-        BrevisApp(address(_brevisProof))
-        Ownable(msg.sender)
-    {}
+        address _brevisRequest
+    ) CLBaseHook(_poolManager) BrevisApp(_brevisRequest) Ownable(msg.sender) {}
 
     function getHooksRegistrationBitmap()
         external
@@ -78,9 +85,9 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
                 Permissions({
                     beforeInitialize: false,
                     afterInitialize: true,
-                    beforeAddLiquidity: true,
+                    beforeAddLiquidity: false,
                     afterAddLiquidity: true,
-                    beforeRemoveLiquidity: true,
+                    beforeRemoveLiquidity: false,
                     afterRemoveLiquidity: true,
                     beforeSwap: true,
                     afterSwap: true,
@@ -88,8 +95,8 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
                     afterDonate: false,
                     beforeSwapReturnsDelta: false,
                     afterSwapReturnsDelta: false,
-                    afterAddLiquidityReturnsDelta: true,
-                    afterRemoveLiquidityReturnsDelta: true
+                    afterAddLiquidityReturnsDelta: false,
+                    afterRemoveLiquidityReturnsDelta: false
                 })
             );
     }
@@ -155,16 +162,251 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
     function afterSwap(
         address,
         PoolKey calldata key,
-        ICLPoolManager.SwapParams calldata,
+        ICLPoolManager.SwapParams calldata params,
         BalanceDelta delta,
         bytes calldata
     ) external override poolManagerOnly returns (bytes4, int128) {
         PoolId poolId = key.toId();
         PoolData storage poolData = poolDataMap[poolId];
 
-        poolData.cumulativeVolume += uint256(uint128(-delta.amount0()));
-        poolData.token0Balance += uint256(uint128(-delta.amount0()));
-        poolData.token1Balance += uint256(uint128(-delta.amount1()));
+        updatePoolData(poolData, delta);
+
+        // Calculate fee
+        uint256 totalFee = poolData.currentTradingFee + poolData.currentLPFee;
+        int128 feeAmount;
+        if (params.zeroForOne) {
+            // Token0 is being swapped for Token1
+            feeAmount = int128(
+                int256((uint256(uint128(-delta.amount0())) * totalFee) / 1e6)
+            );
+        } else {
+            // Token1 is being swapped for Token0
+            feeAmount = int128(
+                int256((uint256(uint128(-delta.amount1())) * totalFee) / 1e6)
+            );
+        }
+
+        // Update historical data
+        if (block.timestamp >= poolData.lastUpdateTimestamp + UPDATE_INTERVAL) {
+            updateHistoricalData(poolId);
+        }
+
+        emit PoolDataUpdated(
+            poolId,
+            poolData.cumulativeVolume,
+            poolData.token0Balance,
+            poolData.token1Balance,
+            calculateVolatility(poolData),
+            poolData.totalLiquidity,
+            poolData.impermanentLoss
+        );
+
+        return (ICLHooks.afterSwap.selector, feeAmount);
+    }
+
+    function afterAddLiquidity(
+        address,
+        PoolKey calldata key,
+        ICLPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) external override poolManagerOnly returns (bytes4, BalanceDelta) {
+        PoolId poolId = key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
+
+        updatePoolData(poolData, delta);
+
+        if (params.liquidityDelta > 0) {
+            poolData.totalLiquidity += uint256(
+                uint128(uint256(params.liquidityDelta))
+            );
+        } else {
+            uint256 liquidityToRemove;
+            if (params.liquidityDelta < 0) {
+                liquidityToRemove = uint256(-params.liquidityDelta);
+            } else {
+                liquidityToRemove = 0;
+            }
+            if (liquidityToRemove > poolData.totalLiquidity) {
+                poolData.totalLiquidity = 0;
+            } else {
+                poolData.totalLiquidity -= liquidityToRemove;
+            }
+        }
+        updateImpermanentLoss(poolId);
+
+        // Update historical data if necessary
+        if (block.timestamp >= poolData.lastUpdateTimestamp + UPDATE_INTERVAL) {
+            updateHistoricalData(poolId);
+        }
+
+        emit PoolDataUpdated(
+            poolId,
+            poolData.cumulativeVolume,
+            poolData.token0Balance,
+            poolData.token1Balance,
+            calculateVolatility(poolData),
+            poolData.totalLiquidity,
+            poolData.impermanentLoss
+        );
+
+        return (ICLHooks.afterAddLiquidity.selector, delta);
+    }
+
+    function afterRemoveLiquidity(
+        address,
+        PoolKey calldata key,
+        ICLPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        bytes calldata
+    ) external override poolManagerOnly returns (bytes4, BalanceDelta) {
+        PoolId poolId = key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
+
+        updatePoolData(poolData, delta);
+
+        uint256 liquidityToRemove = uint256(-params.liquidityDelta);
+        if (liquidityToRemove <= poolData.totalLiquidity) {
+            poolData.totalLiquidity -= liquidityToRemove;
+        } else {
+            poolData.totalLiquidity = 0;
+        }
+        updateImpermanentLoss(poolId);
+
+        // Update historical data
+        if (block.timestamp >= poolData.lastUpdateTimestamp + UPDATE_INTERVAL) {
+            updateHistoricalData(poolId);
+        }
+
+        emit PoolDataUpdated(
+            poolId,
+            poolData.cumulativeVolume,
+            poolData.token0Balance,
+            poolData.token1Balance,
+            calculateVolatility(poolData),
+            poolData.totalLiquidity,
+            poolData.impermanentLoss
+        );
+
+        return (ICLHooks.afterRemoveLiquidity.selector, delta);
+    }
+
+    function lockAcquired(
+        bytes calldata rawData
+    ) external override vaultOnly returns (bytes memory) {
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
+        PoolId poolId = data.key.toId();
+        PoolData storage poolData = poolDataMap[poolId];
+
+        // Update pool data
+        updatePoolData(poolData, data.delta);
+
+        int128 feeAmount = 0;
+
+        if (data.swapParams.amountSpecified != 0) {
+            // This is a swap operation
+            uint256 totalFee = poolData.currentTradingFee +
+                poolData.currentLPFee;
+            if (data.swapParams.zeroForOne) {
+                // Token0 is being swapped for Token1
+                feeAmount = int128(
+                    int256(
+                        (uint256(uint128(-data.delta.amount0())) * totalFee) /
+                            1e6
+                    )
+                );
+            } else {
+                // Token1 is being swapped for Token0
+                feeAmount = int128(
+                    int256(
+                        (uint256(uint128(-data.delta.amount1())) * totalFee) /
+                            1e6
+                    )
+                );
+            }
+        } else {
+            // This is a liquidity change operation
+            if (data.modifyLiquidityParams.liquidityDelta > 0) {
+                poolData.totalLiquidity += uint256(
+                    uint128(uint256(data.modifyLiquidityParams.liquidityDelta))
+                );
+            } else {
+                uint256 liquidityToRemove = uint256(
+                    -data.modifyLiquidityParams.liquidityDelta
+                );
+                if (liquidityToRemove <= poolData.totalLiquidity) {
+                    poolData.totalLiquidity -= liquidityToRemove;
+                } else {
+                    poolData.totalLiquidity = 0;
+                }
+            }
+            updateImpermanentLoss(poolId);
+        }
+
+        // Update historical data if necessary
+        if (block.timestamp >= poolData.lastUpdateTimestamp + UPDATE_INTERVAL) {
+            updateHistoricalData(poolId);
+        }
+
+        emit PoolDataUpdated(
+            poolId,
+            poolData.cumulativeVolume,
+            poolData.token0Balance,
+            poolData.token1Balance,
+            calculateVolatility(poolData),
+            poolData.totalLiquidity,
+            poolData.impermanentLoss
+        );
+
+        return abi.encode(feeAmount);
+    }
+
+    function updatePoolData(
+        PoolData storage poolData,
+        BalanceDelta delta
+    ) internal {
+        // Update token balances safely
+        if (delta.amount0() >= 0) {
+            poolData.token0Balance += uint256(uint128(delta.amount0()));
+        } else {
+            uint256 amount0ToSubtract = uint256(uint128(-delta.amount0()));
+            if (amount0ToSubtract > poolData.token0Balance) {
+                poolData.token0Balance = 0;
+            } else {
+                poolData.token0Balance -= amount0ToSubtract;
+            }
+        }
+
+        if (delta.amount1() >= 0) {
+            poolData.token1Balance += uint256(uint128(delta.amount1()));
+        } else {
+            uint256 amount1ToSubtract = uint256(uint128(-delta.amount1()));
+            if (amount1ToSubtract > poolData.token1Balance) {
+                poolData.token1Balance = 0;
+            } else {
+                poolData.token1Balance -= amount1ToSubtract;
+            }
+        }
+
+        // Calculate absolute values for volume
+        uint256 amount0Abs = delta.amount0() >= 0
+            ? uint256(uint128(delta.amount0()))
+            : uint256(uint128(-delta.amount0()));
+        uint256 amount1Abs = delta.amount1() >= 0
+            ? uint256(uint128(delta.amount1()))
+            : uint256(uint128(-delta.amount1()));
+
+        // Update cumulative volume (use the larger of the two amounts)
+        poolData.cumulativeVolume += amount0Abs > amount1Abs
+            ? amount0Abs
+            : amount1Abs;
+
+        // Update price and volatility
+        updatePriceAndVolatility(poolData);
+    }
+
+    function updatePriceAndVolatility(PoolData storage poolData) internal {
+        if (poolData.token0Balance == 0) return; // Avoid division by zero
 
         uint256 newPrice = (poolData.token1Balance * 1e18) /
             poolData.token0Balance;
@@ -177,84 +419,6 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
             poolData.updateCount++;
         }
         poolData.lastPrice = newPrice;
-
-        updateImpermanentLoss(poolId);
-
-        if (block.timestamp >= poolData.lastUpdateTimestamp + UPDATE_INTERVAL) {
-            updateHistoricalData(poolId);
-        }
-
-        uint256 volatility = calculateVolatility(poolData);
-        emit PoolDataUpdated(
-            poolId,
-            poolData.cumulativeVolume,
-            poolData.token0Balance,
-            poolData.token1Balance,
-            volatility,
-            poolData.totalLiquidity,
-            poolData.impermanentLoss
-        );
-
-        return (ICLHooks.afterSwap.selector, 0);
-    }
-
-    function beforeAddLiquidity(
-        address,
-        PoolKey calldata key,
-        ICLPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata
-    ) external override poolManagerOnly returns (bytes4) {
-        PoolId poolId = key.toId();
-        PoolData storage poolData = poolDataMap[poolId];
-        if (params.liquidityDelta > 0) {
-            poolData.totalLiquidity += uint256(
-                uint128(uint256(params.liquidityDelta))
-            );
-        }
-        return ICLHooks.beforeAddLiquidity.selector;
-    }
-
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata key,
-        ICLPoolManager.ModifyLiquidityParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) external override poolManagerOnly returns (bytes4, BalanceDelta) {
-        updateImpermanentLoss(key.toId());
-        return (ICLHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
-    }
-
-    function beforeRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        ICLPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata
-    ) external override poolManagerOnly returns (bytes4) {
-        PoolId poolId = key.toId();
-        PoolData storage poolData = poolDataMap[poolId];
-
-        if (params.liquidityDelta < 0) {
-            uint256 liquidityToRemove = uint256(-params.liquidityDelta);
-            if (liquidityToRemove <= poolData.totalLiquidity) {
-                poolData.totalLiquidity -= liquidityToRemove;
-            } else {
-                poolData.totalLiquidity = 0;
-            }
-        }
-
-        return ICLHooks.beforeRemoveLiquidity.selector;
-    }
-
-    function afterRemoveLiquidity(
-        address,
-        PoolKey calldata key,
-        ICLPoolManager.ModifyLiquidityParams calldata,
-        BalanceDelta,
-        bytes calldata
-    ) external override poolManagerOnly returns (bytes4, BalanceDelta) {
-        updateImpermanentLoss(key.toId());
-        return (ICLHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
 
     function updateHistoricalData(PoolId poolId) internal {
@@ -293,23 +457,44 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
 
     function updateImpermanentLoss(PoolId poolId) internal {
         PoolData storage poolData = poolDataMap[poolId];
+
+        if (poolData.token0Balance == 0) {
+            poolData.impermanentLoss = 0;
+            return;
+        }
+
         uint256 currentPrice = (poolData.token1Balance * 1e18) /
             poolData.token0Balance;
-        uint256 initialPrice = poolData.historicalVolumes[
-            HISTORICAL_DATA_POINTS - 1
-        ] > 0
-            ? (poolData.historicalLiquidities[HISTORICAL_DATA_POINTS - 1] *
-                1e18) / poolData.historicalVolumes[HISTORICAL_DATA_POINTS - 1]
-            : currentPrice;
+
+        uint256 initialPrice;
+        if (poolData.historicalVolumes[HISTORICAL_DATA_POINTS - 1] > 0) {
+            initialPrice =
+                (poolData.historicalLiquidities[HISTORICAL_DATA_POINTS - 1] *
+                    1e18) /
+                poolData.historicalVolumes[HISTORICAL_DATA_POINTS - 1];
+        } else {
+            initialPrice = currentPrice;
+        }
+
+        // Check if initialPrice is zero to avoid division by zero
+        if (initialPrice == 0) {
+            poolData.impermanentLoss = 0;
+            return;
+        }
 
         uint256 priceRatio = (currentPrice * 1e18) / initialPrice;
         uint256 sqrtPriceRatio = FixedPointMathLib.sqrt(priceRatio);
 
         // IL = 2 * sqrt(P_ratio) / (1 + P_ratio) - 1
-        poolData.impermanentLoss =
-            (2 * sqrtPriceRatio * 1e18) /
-            (1e18 + priceRatio) -
-            1e18;
+        // Check if (1e18 + priceRatio) is zero to avoid division by zero
+        if (1e18 + priceRatio == 0) {
+            poolData.impermanentLoss = 0;
+        } else {
+            poolData.impermanentLoss =
+                (2 * sqrtPriceRatio * 1e18) /
+                (1e18 + priceRatio) -
+                1e18;
+        }
     }
 
     function handleProofResult(
@@ -326,6 +511,13 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
         poolData.currentLPFee = newLPFee;
 
         emit FeesUpdated(poolId, newTradingFee, newLPFee);
+    }
+
+    function handleOpProofResult(
+        bytes32 _vkHash,
+        bytes calldata _circuitOutput
+    ) internal override {
+        handleProofResult(_vkHash, _circuitOutput);
     }
 
     function decodeOutput(
@@ -378,5 +570,12 @@ contract DynamicFeeAdjustmentHook is CLBaseHook, BrevisApp, Ownable {
 
     function setVkHash(bytes32 _vkHash) external onlyOwner {
         vkHash = _vkHash;
+    }
+
+    function setBrevisOpConfig(
+        uint64 _challengeWindow,
+        uint8 _sigOption
+    ) external onlyOwner {
+        brevisOpConfig = BrevisOpConfig(_challengeWindow, _sigOption);
     }
 }
