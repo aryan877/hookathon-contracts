@@ -8,7 +8,7 @@ import {Currency} from "pancake-v4-core/src/types/Currency.sol";
 import {PoolKey} from "pancake-v4-core/src/types/PoolKey.sol";
 import {CLPoolParametersHelper} from "pancake-v4-core/src/pool-cl/libraries/CLPoolParametersHelper.sol";
 import {CLCounterHook} from "../../src/pool-cl/CLCounterHook.sol";
-import {CLTestUtils} from "./utils/CLTestUtils.sol";
+import {CLTestUtils} from "../pool-cl/utils/CLTestUtils.sol";
 import {CLPoolParametersHelper} from "pancake-v4-core/src/pool-cl/libraries/CLPoolParametersHelper.sol";
 import {PoolIdLibrary} from "pancake-v4-core/src/types/PoolId.sol";
 import {ICLRouterBase} from "pancake-v4-periphery/src/pool-cl/interfaces/ICLRouterBase.sol";
@@ -34,7 +34,8 @@ contract CLCounterHookTest is Test, CLTestUtils {
             poolManager: poolManager,
             fee: uint24(3000), // 0.3% fee
             // tickSpacing: 10
-            parameters: bytes32(uint256(hook.getHooksRegistrationBitmap())).setTickSpacing(10)
+            parameters: bytes32(uint256(hook.getHooksRegistrationBitmap()))
+                .setTickSpacing(10)
         });
 
         // initialize pool at 1:1 price point (assume stablecoin pair)

@@ -6,3 +6,4 @@ pancake-v4-core/=lib/pancake-v4-universal-router/lib/pancake-v4-periphery/lib/pa
 pancake-v4-periphery/=lib/pancake-v4-universal-router/lib/pancake-v4-periphery/
 pancake-v4-universal-router/=lib/pancake-v4-universal-router/
 permit2/=lib/pancake-v4-universal-router/lib/pancake-v4-periphery/lib/permit2/
+solidity-rlp/=lib/solidity-rlp/
