@@ -47,7 +47,7 @@ contract DynamicFeeAdjustmentHookTest is Test, Deployers, DeployPermit2 {
         token1 = new MockERC20("Token1", "TK1", 18);
         (currency0, currency1) = SortTokens.sort(token0, token1);
 
-        mockBrevisRequest = address(this);
+        mockBrevisRequest = address(0xbeef);
         hook = new DynamicFeeAdjustmentHook(poolManager, mockBrevisRequest);
 
         poolKey = PoolKey({
@@ -159,6 +159,7 @@ contract DynamicFeeAdjustmentHookTest is Test, Deployers, DeployPermit2 {
             bytes3(uint24(newLPFee))
         );
 
+        vm.prank(mockBrevisRequest);
         hook.brevisCallback(vkHash, circuitOutput);
 
         (
